@@ -144,7 +144,15 @@ def _get_attention_scores_no_kv_chunking(
     upcast_attention: bool,
     mask,
     inplace_softmax: bool = False,
+    fused_attention = None,
 ) -> Tensor:
+    if fused_attention is not None:
+        # The caller opted in. A backend that recognises these tensors returns a
+        # result, and one that does not returns None so this path still runs.
+        fused = fused_attention(query, key_t, value, scale, upcast_attention, mask)
+        if fused is not None:
+            return fused
+
     if upcast_attention:
         with torch.autocast(enabled=False, device_type = 'cuda'):
             query = query.float()
@@ -205,6 +213,7 @@ def efficient_dot_product_attention(
     upcast_attention=False,
     mask = None,
     inplace_softmax=False,
+    fused_attention=None,
 ):
     """Computes efficient dot-product attention given query, transposed key, and value.
       This is efficient version of attention presented in
@@ -256,6 +265,7 @@ def efficient_dot_product_attention(
         scale=scale,
         upcast_attention=upcast_attention,
         inplace_softmax=inplace_softmax,
+        fused_attention=fused_attention,
     ) if k_tokens <= kv_chunk_size else (
         # fast-path for when there's just 1 key-value chunk per query chunk (this is just sliced attention btw)
         partial(
