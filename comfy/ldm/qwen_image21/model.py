@@ -196,6 +196,15 @@ class QwenImage21FunControl(nn.Module):
         return c, block.after_proj(c)
 
 
+def causal_mask(n, length, device, dtype):
+    # Additive form of the Qwen block-causal mask: 0 where a query may attend, -inf where it may not.
+    # The generic ComfyUI attention paths add the mask to the raw scores, so a torch.bool mask would
+    # silently add +1.0 at True and +0.0 at False and mask nothing. Emitting the additive form here
+    # keeps that contract intact without changing shared attention behaviour for other models.
+    allowed = torch.ones((n, length + n), dtype=torch.bool, device=device).tril(length)
+    return torch.zeros((n, length + n), dtype=dtype, device=device).masked_fill_(~allowed, float("-inf"))
+
+
 def block_causal_attention(segments, transformer_options={}, cache=None, block_index=0, prefix_len=0):
     # segments: (start, end, mask); text segments get a causal mask, image blocks attend to everything before their end
     def attn(q, k, v, heads, preferred_attention=None):
@@ -399,7 +408,7 @@ class QwenImage21Transformer2DModel(nn.Module):
             if n > 0:
                 parts.append(txt[:, start:end])
                 ids.append(torch.arange(pos, pos + n, device=x.device, dtype=torch.float32).unsqueeze(1).expand(n, 3))
-                segments.append((length, length + n, torch.ones((n, length + n), dtype=torch.bool, device=x.device).tril(length)))
+                segments.append((length, length + n, causal_mask(n, length, x.device, txt.dtype)))
                 pos += n
                 length += n
             h, w = img.shape[-2:]
