@@ -4,10 +4,28 @@ import torch
 
 import comfy.text_encoders.qwen3vl
 from comfy import sd1_clip
+from comfy.ldm.modules.attention import FixedChunkAttentionPolicy
 
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
 SYSTEM_PROMPT = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n"
 T2I_TEMPLATE = SYSTEM_PROMPT + "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n"
+
+# Conditioning this path exists for: a 1024x1536 and a 768x1024 reference image reach the
+# vision tower as 6144 and 3072 tokens, and the language model runs at 2434 tokens. Both
+# stages then materialise a score matrix several times the size of everything else they
+# allocate, and neither of them bounds it: the vision tower is on `attention_sub_quad`,
+# whose chunk size comes from the free device memory, and the language model is on
+# `attention_basic`, which does not chunk at all. Pinning the chunk bounds both: the
+# vision transient drops from 1554 MiB to 220 MiB and the language model's from 1524 MiB
+# to 298 MiB, measured on the geometries above. See
+# evidence/reports/29_qwen21_edit_te_conditioning_optimization.md.
+VISION_ATTENTION = FixedChunkAttentionPolicy(query_chunk_size=512)
+
+# The same policy for the language model, with a size gate: this text encoder also serves
+# the plain text-to-image path, where the sequence is a prompt and the score matrix is
+# small enough that there is nothing to gain. 128 MiB is well above that path and well
+# below the 758 MiB the edit conditioning needs.
+LM_ATTENTION = FixedChunkAttentionPolicy(query_chunk_size=512, min_score_bytes=128 * 1024 * 1024)
 
 
 class QwenImage21Tokenizer(comfy.text_encoders.qwen3vl.Qwen3VLTokenizer):
@@ -33,6 +51,10 @@ class QwenImage21Qwen3VLClipModel(comfy.text_encoders.qwen3vl.Qwen3VLClipModel):
         # last layer without the final RMSNorm: transformers 4.57 hidden_states[-1], which Qwen's results are tuned to (5.x norms it)
         self.layer_norm_hidden_state = False
         self.image_spans = []
+        # Scoped to this text encoder, not to `Qwen35VisionModel` or `Llama2_`, which are
+        # shared with every other Qwen3.5/Qwen3-VL text encoder.
+        self.transformer.visual.attention_policy = VISION_ATTENTION
+        self.transformer.model.attention_policy = LM_ATTENTION
 
     def process_tokens(self, tokens, device):
         embeds, attention_mask, num_tokens, embeds_info = super().process_tokens(tokens, device)
