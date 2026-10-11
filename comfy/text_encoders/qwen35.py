@@ -713,6 +713,10 @@ class Qwen35VisionModel(nn.Module):
         self.merger = Qwen35VisionPatchMerger(self.hidden_size, self.spatial_merge_size, config["out_hidden_size"], device=device, dtype=dtype, ops=ops)
         self.deepstack_visual_indexes = [] # DeepStack, per-layer visual features (Qwen3-VL)
         self.deepstack_merger_list = None
+        # Optional `FixedChunkAttentionPolicy`. This tower is shared by every Qwen3.5 and
+        # Qwen3-VL text encoder, so the default stays whatever `optimized_attention_for_device`
+        # resolved; only a caller that knows its own geometry sets one.
+        self.attention_policy = None
 
     def rot_pos_emb(self, grid_thw):
         merge_size = self.spatial_merge_size
@@ -814,6 +818,12 @@ class Qwen35VisionModel(nn.Module):
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
         optimized_attention = optimized_attention_for_device(x.device, mask=False, small_input=True)
+        if self.attention_policy is not None:
+            # `seq_len` rather than the per-sequence length: the policy's size gate is an
+            # upper bound on the score matrix, and with no gate (the vision case) the
+            # argument is unused.
+            optimized_attention = self.attention_policy.apply(
+                optimized_attention, self.num_heads, seq_len, seq_len, x.element_size())
         deepstack_features = []
         for layer_num, blk in enumerate(self.blocks):
             x = blk(x, cu_seqlens=cu_seqlens, position_embeddings=position_embeddings, optimized_attention=optimized_attention)

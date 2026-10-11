@@ -950,6 +950,11 @@ class Llama2_(nn.Module):
         if config.lm_head:
             self.lm_head = ops.Linear(config.hidden_size, config.vocab_size, bias=False, device=device, dtype=dtype)
 
+        # Optional `FixedChunkAttentionPolicy`. This core backs every llama-family text
+        # encoder, so the default stays whatever `optimized_attention_for_device` resolved;
+        # only a caller that knows its own sequence geometry sets one.
+        self.attention_policy = None
+
     def get_dynamic_vram__units(self):
         return (list(self.layers), []) if self.graph_dynamic_vbar_blocks else ([], [])
 
@@ -1023,6 +1028,11 @@ class Llama2_(nn.Module):
                 mask = causal_mask
 
         optimized_attention = optimized_attention_for_device(x.device, mask=mask is not None, small_input=True)
+        if self.attention_policy is not None:
+            # past_len is 0 for the conditioning pass this exists for; keeping it in makes
+            # the gate correct for the cached decode passes that share this forward.
+            optimized_attention = self.attention_policy.apply(
+                optimized_attention, self.config.num_attention_heads, seq_len, past_len + seq_len, x.element_size())
 
         enable_graph = self.graph_dynamic_vbar_blocks and (fixed_kv_decode or spec_decode)
         if enable_graph:
