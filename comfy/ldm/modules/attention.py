@@ -318,7 +318,7 @@ def attention_basic(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     return out
 
 @wrap_attn
-def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, query_chunk_size=None, kv_chunk_size=None, **kwargs):
     attn_precision = get_attn_precision(attn_precision, query.dtype)
 
     if skip_reshape:
@@ -356,15 +356,25 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
     mem_free_total, _ = model_management.get_free_memory(query.device, True)
 
     kv_chunk_size_min = None
-    kv_chunk_size = None
-    query_chunk_size = None
 
-    for x in [4096, 2048, 1024, 512, 256]:
-        count = mem_free_total / (batch_x_heads * bytes_per_token * x * 4.0)
-        if count >= k_tokens:
+    if query_chunk_size is not None or kv_chunk_size is not None:
+        # Explicit chunking requested by the caller. kv_chunk_size < k_tokens selects the
+        # two-level streaming path in efficient_dot_product_attention; leaving both as None
+        # keeps the original greedy free-memory heuristic untouched.
+        if query_chunk_size is None:
+            query_chunk_size = 512
+        if kv_chunk_size is None:
             kv_chunk_size = k_tokens
-            query_chunk_size = x
-            break
+    else:
+        query_chunk_size = None
+        kv_chunk_size = None
+
+        for x in [4096, 2048, 1024, 512, 256]:
+            count = mem_free_total / (batch_x_heads * bytes_per_token * x * 4.0)
+            if count >= k_tokens:
+                kv_chunk_size = k_tokens
+                query_chunk_size = x
+                break
 
     if query_chunk_size is None:
         query_chunk_size = 512
