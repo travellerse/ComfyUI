@@ -15,6 +15,7 @@ from comfy.ldm.flux.layers import EmbedND, timestep_embedding
 from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.lightricks.model import TimestepEmbedding
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
+from comfy.ldm.qwen_image21.fused_attention import fused_attention as qwen21_fused_attention
 from comfy.ldm.wan.model_animate2 import PoseBranchCache, quantize_cache
 
 
@@ -212,6 +213,9 @@ def block_causal_attention(segments, transformer_options={}, cache=None, block_i
         if cache is not None:
             # K and V stacked on dim 1 so batch stays first and quantized rows are per token and head
             cache.put(block_index, torch.stack([k[:, :prefix_len], v[:, :prefix_len]], dim=1))
+        # Fixed query chunk for this geometry: the greedy free-VRAM chooser in
+        # attention_sub_quad reads `reserved - active`, which swings by GiBs between
+        # step 1 and the rest of the run, so it picked 4096 then 2048. Pinned here.
         outs = []
         for i, (start, end, mask) in enumerate(segments):
             query = AttentionTensorContainer(q[:, start:end].flatten(2))
@@ -219,7 +223,7 @@ def block_causal_attention(segments, transformer_options={}, cache=None, block_i
             value = AttentionTensorContainer(v[:, :end].flatten(2))
             if i == len(segments) - 1:
                 del q, k, v
-            outs.append(optimized_attention(query, key, value, heads, mask=mask, transformer_options=transformer_options, preferred_attention=preferred_attention))
+            outs.append(optimized_attention(query, key, value, heads, mask=mask, transformer_options=transformer_options, preferred_attention=preferred_attention, query_chunk_size=1024, inplace_softmax=True, fused_attention=qwen21_fused_attention))
         return torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]
     return attn
 
@@ -230,7 +234,7 @@ def prefix_cached_attention(prefix_k, prefix_v, transformer_options={}):
         q = AttentionTensorContainer(q.take().flatten(2))
         k = AttentionTensorContainer(torch.cat([prefix_k, k.take()], dim=1).flatten(2))
         v = AttentionTensorContainer(torch.cat([prefix_v, v.take()], dim=1).flatten(2))
-        return optimized_attention(q, k, v, heads, transformer_options=transformer_options, preferred_attention=preferred_attention)
+        return optimized_attention(q, k, v, heads, transformer_options=transformer_options, preferred_attention=preferred_attention, query_chunk_size=1024, inplace_softmax=True, fused_attention=qwen21_fused_attention)
     return attn
 
 
