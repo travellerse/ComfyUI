@@ -1002,6 +1002,48 @@ def optimized_attention_for_device(device, mask=False, small_input=False):
     return optimized_attention
 
 
+class FixedChunkAttentionPolicy:
+    """Bounds the transient of a full-score-matrix attention path by pinning its query chunk.
+
+    Two of the backends materialise the whole `(heads, q_tokens, k_tokens)` score matrix.
+    `attention_basic` does it in one piece; `attention_sub_quad` chunks it, but picks the
+    chunk from the free device memory, and that number swings by GiBs between steps of the
+    same run, so neither transient is bounded by anything the caller controls. Pinning the
+    chunk turns it into a function of the shapes. `inplace_softmax` removes the second
+    tensor of the same size that the softmax otherwise writes.
+
+    A policy is inert unless both of these hold, and both are decided from values that are
+    already known, never by attempting a call and catching the failure:
+
+    * the resolved backend is one of `REPLACEABLE`. Anything else was enabled deliberately
+      by the user - sage, flash, xformers, pytorch - and is left alone.
+    * the score matrix is at least `min_score_bytes`. Below that it is not the binding
+      allocation and there is nothing to gain, so callers that share a model with a
+      short-sequence path keep the backend they had.
+
+    `apply` returns the attention function to use, which is the one it was given whenever
+    the policy does not apply.
+    """
+
+    REPLACEABLE = (attention_basic, attention_sub_quad)
+
+    def __init__(self, query_chunk_size, min_score_bytes=0, inplace_softmax=True):
+        self.query_chunk_size = query_chunk_size
+        self.min_score_bytes = min_score_bytes
+        self.inplace_softmax = inplace_softmax
+
+    def apply(self, attention_function, heads, q_tokens, k_tokens, element_size):
+        if attention_function not in self.REPLACEABLE:
+            return attention_function
+        if heads * q_tokens * k_tokens * element_size < self.min_score_bytes:
+            return attention_function
+        return functools.partial(
+            attention_sub_quad,
+            query_chunk_size=self.query_chunk_size,
+            inplace_softmax=self.inplace_softmax,
+        )
+
+
 class CrossAttention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0., attn_precision=None, dtype=None, device=None, operations=ops):
         super().__init__()
