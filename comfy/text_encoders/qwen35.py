@@ -817,7 +817,7 @@ class Qwen35VisionModel(nn.Module):
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
         ).cumsum(dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        optimized_attention = optimized_attention_for_device(x.device, mask=False, small_input=True)
+        optimized_attention = optimized_attention_for_device(x.device, mask=False, small_input=False)
         if self.attention_policy is not None:
             # `seq_len` rather than the per-sequence length: the policy's size gate is an
             # upper bound on the score matrix, and with no gate (the vision case) the
