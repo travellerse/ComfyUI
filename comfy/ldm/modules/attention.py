@@ -318,7 +318,7 @@ def attention_basic(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     return out
 
 @wrap_attn
-def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, query_chunk_size=None, kv_chunk_size=None, **kwargs):
+def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, query_chunk_size=None, kv_chunk_size=None, contiguous_key=False, **kwargs):
     attn_precision = get_attn_precision(attn_precision, query.dtype)
 
     if skip_reshape:
@@ -342,6 +342,12 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
         query = query.permute(0, 2, 1, 3).reshape(b * heads, -1, dim_head)
         value = value.permute(0, 2, 1, 3).reshape(b * heads, -1, dim_head)
         key = key.permute(0, 2, 3, 1).reshape(b * heads, dim_head, -1)
+        if contiguous_key:
+            # EXPERIMENTAL, off by default. The permute above leaves `key` as a strided
+            # view (strides ~ (dim_head, 1, k_tokens)), and rocBLAS/Tensile on gfx1030
+            # picks a much weaker micro-tile for a strided B operand. Materialising it
+            # costs one copy of K; see CONTIGUOUS_KEY.md for the measurements.
+            key = key.contiguous()
 
 
     dtype = query.dtype
