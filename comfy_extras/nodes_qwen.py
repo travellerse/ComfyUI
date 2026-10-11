@@ -178,8 +178,20 @@ class TextEncodeQwenImage21(io.ComfyNode):
         if len(ref_latents) > 0:
             positive = node_helpers.conditioning_set_values(positive, {"reference_latents": ref_latents}, append=True)
             negative = node_helpers.conditioning_set_values(negative, {"reference_latents": ref_latents}, append=True)
+        # Component lifecycle: positive and negative are both encoded and fully materialized
+        # into plain tensors, so the text encoder has no remaining work in this execution.
+        # Release it here instead of waiting for the DiT to evict it under memory pressure.
+        # Scoped to this patcher, so the DiT, VAE and control models stay resident.
+        cls.release_text_encoder(clip)
         latent = torch.zeros([1, 64, latent_h // 16, latent_w // 16], device=comfy.model_management.intermediate_device())
         return io.NodeOutput(positive, negative, {"samples": latent})
+
+    @classmethod
+    def release_text_encoder(cls, clip):
+        patcher = getattr(clip, "patcher", None)
+        if patcher is None:
+            return
+        comfy.model_management.unload_model_and_clones(patcher, unload_additional_models=True, all_devices=True)
 
 
 class QwenImage21Cache(io.ComfyNode):
