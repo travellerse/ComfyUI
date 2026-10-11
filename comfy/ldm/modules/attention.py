@@ -318,7 +318,7 @@ def attention_basic(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     return out
 
 @wrap_attn
-def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, query_chunk_size=None, kv_chunk_size=None, contiguous_key=False, **kwargs):
+def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, query_chunk_size=None, kv_chunk_size=None, contiguous_key=False, inplace_softmax=False, **kwargs):
     attn_precision = get_attn_precision(attn_precision, query.dtype)
 
     if skip_reshape:
@@ -402,6 +402,7 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
         use_checkpoint=False,
         upcast_attention=upcast_attention,
         mask=mask,
+        inplace_softmax=inplace_softmax,
     )
 
     hidden_states = hidden_states.to(dtype)

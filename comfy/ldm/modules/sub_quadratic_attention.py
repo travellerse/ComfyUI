@@ -143,6 +143,7 @@ def _get_attention_scores_no_kv_chunking(
     scale: float,
     upcast_attention: bool,
     mask,
+    inplace_softmax: bool = False,
 ) -> Tensor:
     if upcast_attention:
         with torch.autocast(enabled=False, device_type = 'cuda'):
@@ -166,17 +167,25 @@ def _get_attention_scores_no_kv_chunking(
 
     if mask is not None:
         attn_scores += mask
-    try:
-        attn_probs = attn_scores.softmax(dim=-1)
-        del attn_scores
-    except Exception as e:
-        model_management.raise_non_oom(e)
-        logging.warning("ran out of memory while running softmax in  _get_attention_scores_no_kv_chunking, trying slower in place softmax instead")
-        attn_scores -= attn_scores.max(dim=-1, keepdim=True).values # noqa: F821 attn_scores is not defined
-        torch.exp(attn_scores, out=attn_scores)
-        summed = torch.sum(attn_scores, dim=-1, keepdim=True)
-        attn_scores /= summed
+    if inplace_softmax and not torch.is_grad_enabled():
+        # attn_scores is a fresh baddbmm output that nothing else references and the
+        # mask has already been added in place, so the softmax can write over it and
+        # save a second tensor the same size. The out= form is illegal under autograd,
+        # hence the guard.
+        torch.softmax(attn_scores, dim=-1, out=attn_scores)
         attn_probs = attn_scores
+    else:
+        try:
+            attn_probs = attn_scores.softmax(dim=-1)
+            del attn_scores
+        except Exception as e:
+            model_management.raise_non_oom(e)
+            logging.warning("ran out of memory while running softmax in  _get_attention_scores_no_kv_chunking, trying slower in place softmax instead")
+            attn_scores -= attn_scores.max(dim=-1, keepdim=True).values # noqa: F821 attn_scores is not defined
+            torch.exp(attn_scores, out=attn_scores)
+            summed = torch.sum(attn_scores, dim=-1, keepdim=True)
+            attn_scores /= summed
+            attn_probs = attn_scores
 
     hidden_states_slice = torch.bmm(attn_probs.to(value.dtype), value)
     return hidden_states_slice
@@ -195,6 +204,7 @@ def efficient_dot_product_attention(
     use_checkpoint=True,
     upcast_attention=False,
     mask = None,
+    inplace_softmax=False,
 ):
     """Computes efficient dot-product attention given query, transposed key, and value.
       This is efficient version of attention presented in
@@ -244,7 +254,8 @@ def efficient_dot_product_attention(
     compute_query_chunk_attn: ComputeQueryChunkAttn = partial(
         _get_attention_scores_no_kv_chunking,
         scale=scale,
-        upcast_attention=upcast_attention
+        upcast_attention=upcast_attention,
+        inplace_softmax=inplace_softmax,
     ) if k_tokens <= kv_chunk_size else (
         # fast-path for when there's just 1 key-value chunk per query chunk (this is just sliced attention btw)
         partial(
