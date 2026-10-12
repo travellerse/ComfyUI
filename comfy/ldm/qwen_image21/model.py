@@ -15,7 +15,7 @@ from comfy.ldm.flux.layers import EmbedND, timestep_embedding
 from comfy.ldm.flux.math import apply_rope1
 from comfy.ldm.lightricks.model import TimestepEmbedding
 from comfy.ldm.modules.attention import AttentionTensorContainer, ComfyAttention, optimized_attention
-from comfy.ldm.qwen_image21.fused_attention import fused_attention as qwen21_fused_attention
+from comfy.ldm.qwen_image21.fused_attention import fused_attention_guarded as qwen21_fused_attention
 from comfy.ldm.wan.model_animate2 import PoseBranchCache, quantize_cache
 
 

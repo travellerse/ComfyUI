@@ -12,6 +12,15 @@ one model on RDNA2, and returns `None` for everything else so the caller falls
 back to the existing implementation. Support is decided by inspecting the tensors,
 not by catching exceptions, so a bug in this file surfaces as a crash rather than
 as a silent downgrade.
+
+Correction after measurement (evidence/ reports 42 and 43): the transient the docstring above
+calls "the peak of the whole attention block" is not the peak of the *run*. The sub-quadratic path
+allocates and frees it inside the attention call, and the block's peak is set by the MLP's
+`gate_up` output, so both paths peak within ~2 MiB of each other at every geometry tested here --
+while the sub-quadratic path is 1.46x faster. Hence `SCORE_BUDGET_BYTES` and
+`fused_attention_guarded` below: the model passes the guarded entry point, so this kernel is the
+large-geometry branch rather than the default. `fused_attention` itself keeps its original
+"can this be served" contract, which the device tests depend on.
 """
 
 import logging
@@ -39,9 +48,38 @@ SUPPORTED_HEAD_DIM = 128
 # memory ceiling, but that is an assumption, so they are listed and not claimed.
 SUPPORTED_ARCHS = ("gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036")
 
+# When this kernel should be used at all, as opposed to when it merely *can* be.
+#
+# Measured on gfx1030 through the same entry point the DiT uses, at the production geometry
+# (batch_x_heads=32, query_chunk_size=1024, k_tokens=10287 -> 642 MiB of scores): the sub-quadratic
+# path is 1.46x faster (115.75 vs 168.69 ms per block call), and its score tensors are served from
+# the pool the allocator had already reserved, so the run's peak physical VRAM does not move
+# (10922-11336 MiB ON vs 10970-11273 MiB OFF, report 43 §4.1; per-block peak 752 vs 720 MiB at
+# 5120 tokens and 2116 vs 2114 MiB at 15000 tokens, report 43 §2.3). The saving this kernel was
+# written for is therefore real at the allocation level and invisible at the peak.
+#
+# Above this boundary nothing has been measurable on this card: the 2400x1600 branch reaches
+# 12120 MiB of 12272 with the fused path and was interrupted by the host-RAM guard before it could
+# finish in either mode (report 43 §3). So keeping the kernel there is a margin, not a demonstrated
+# benefit -- and it must not be described as a proven OOM guard.
+SCORE_BUDGET_BYTES = 1024 ** 3
+
+
+def score_matrix_bytes(query, key_t):
+    """What the fallback would materialise for this call: one (BH, q_tokens, k_tokens) tensor."""
+    return query.shape[0] * query.shape[1] * key_t.shape[2] * query.element_size()
+
+
+def prefer_fallback(query, key_t):
+    """Whether the sub-quadratic path should handle this call. A pure function of the shapes."""
+    return score_matrix_bytes(query, key_t) <= SCORE_BUDGET_BYTES
+
+
 # The kernel is forward only and carries no autograd, so it is only correct under
 # inference. Exposed so tests and the benchmark harness can assert what actually ran.
-stats = {"fused_calls": 0, "fallback_calls": 0, "compile_failures": 0}
+# `budget_fallbacks` counts calls this file could serve but hands back to the fallback because
+# that is faster there -- see SCORE_BUDGET_BYTES.
+stats = {"fused_calls": 0, "fallback_calls": 0, "compile_failures": 0, "budget_fallbacks": 0}
 _logged_unsupported = set()
 
 _triton_state = None
@@ -227,3 +265,16 @@ def is_supported(query, key_t, value, upcast_attention=False, mask=None):
     if _unsupported_reason(query, key_t, value, upcast_attention, mask) is not None:
         return False
     return _load_triton()[0] is not None
+
+
+def fused_attention_guarded(query, key_t, value, scale, upcast_attention, mask):
+    """The hook the DiT passes: `fused_attention`, except where the fallback is the better call.
+
+    Deliberately a wrapper rather than a rule inside `fused_attention`: that function's contract is
+    "can this shape be served by this kernel", which its device tests and the benchmark harness
+    depend on. Whether it *should* be served is routing policy, and it belongs at the call site.
+    """
+    if prefer_fallback(query, key_t):
+        stats["budget_fallbacks"] += 1
+        return None
+    return fused_attention(query, key_t, value, scale, upcast_attention, mask)
