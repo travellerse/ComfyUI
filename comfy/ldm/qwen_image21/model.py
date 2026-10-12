@@ -62,10 +62,17 @@ class SwiGLUFeedForward(nn.Module):
             self.proj = operations.Linear(dim, hidden_dim, bias=False, dtype=dtype, device=device)
             self.gate_layer = operations.Linear(dim, hidden_dim, bias=False, dtype=dtype, device=device)
         self.out = operations.Linear(hidden_dim, dim, bias=False, dtype=dtype, device=device)
+        # The down projection is the one GEMM in this model whose reduction is several times its
+        # output width, and rocBLAS tiles that shape badly: 2.97 TFLOPs against 13.4 for the same
+        # product with the operands swapped (gfx1030 / ROCm 7.2, tokens=5120). Derived from the
+        # config rather than hard-coded, and scoped to this module, so no other architecture or
+        # shape can reach it. See evidence/OPTIMIZATION_LEDGER.md Q21-OPT-006.
+        self.transposed_down_projection = hidden_dim > 2 * dim
 
     def forward(self, x):
         if self.fused:
-            return comfy.ops.linear_input_act(self.out, self.gate_up(x), "swiglu")
+            return comfy.ops.linear_input_act(self.out, self.gate_up(x), "swiglu",
+                                              transposed=self.transposed_down_projection)
         return self.out(F.silu(self.gate_layer(x)) * self.proj(x))
 
 

@@ -1078,14 +1078,47 @@ def _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_
         )
 
 
+def linear_transposed(linear, x):
+    """``linear(x)`` computed as ``(weight @ x.T).T``.
+
+    rocBLAS tiles ``x @ weight.T`` badly when the reduction is several times the output width.
+    Measured on gfx1030 / ROCm 7.2 / torch 2.13.0+rocm7.2, tokens=5120: the Qwen-Image-2.1 MLP
+    down-projection ``[5120 x 12288] @ [4096 x 12288].T`` ran at 2.97 TFLOPs, while the same
+    product with the operands swapped ran at 13.4 (4.5x). It is a *loss* elsewhere - 0.59x on the
+    attention projections and 0.80x on the up-projection - so callers must scope it to shapes
+    they have measured themselves; it is not a general replacement.
+
+    Accuracy is the same class, not the same bits: against a float64 reference the two forms
+    report identical max and mean absolute error, and ``F.linear`` is bit-deterministic here, so
+    the difference is a different rounding path rather than a different amount of error.
+
+    The weight comes from the layer's own ``cast_bias_weight`` when it has one, because a
+    quantised layer (the GGUF path) dequantises only from inside its own implementation.
+
+    ``x`` may be N-D - the DiT calls this with (batch, tokens, hidden) - so the swap is over the
+    last two dims rather than ``.t()``.
+    """
+    cast = getattr(linear, "cast_bias_weight", None)
+    if cast is not None:
+        res = cast(x)
+        weight, bias = res[0], res[1]
+    else:
+        weight, bias = cast_bias_weight(linear, x, offloadable=False)
+    out = (weight @ x.transpose(-1, -2)).transpose(-1, -2).contiguous()
+    if bias is not None:
+        out = out + bias
+    return out
+
+
 def linear_input_act(linear, x, input_act, act_weight=None, act_eps=0.0,
-                     residual=None, residual_scale=None):
+                     residual=None, residual_scale=None, transposed=False):
     run_every_op()
     weight = linear.weight
     quantized = isinstance(weight, QuantizedTensor)
-    if (comfy.model_management.in_training or getattr(linear, "comfy_force_forward", False) or getattr(linear, "_full_precision_mm", False)
+    if (comfy.model_management.in_training or getattr(linear, "comfy_force_forward", False) or getattr(linear, "_full_precision_mm", False) or transposed
             or not (quantized or _fp16_linear_wanted(x))):
-        out = linear(_eager_input_act(x, input_act, act_weight, act_eps))
+        activated = _eager_input_act(x, input_act, act_weight, act_eps)
+        out = linear_transposed(linear, activated) if transposed else linear(activated)
         return _linear_residual(out, residual, residual_scale)
 
     with CastBiasWeightContext(linear, x, offloadable=True,
