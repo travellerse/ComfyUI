@@ -28,8 +28,18 @@ import inspect
 import pytest
 import torch
 
-from comfy.ldm.modules import sub_quadratic_attention as sqa
-from comfy.ldm.modules.attention import attention_basic, attention_split, attention_sub_quad
+# comfy.model_management resolves the torch device at import (comfy/model_management.py:364 ->
+# get_torch_device) and sub_quadratic_attention pulls it in, so this file raised at collection
+# on a host with no visible GPU even though it never runs a device op. Declaring cpu mode first
+# keeps it importable with the device hidden, which is what lets the negative control run in a
+# detached worktree without taking the GPU. Same guard as the sibling release-lifecycle test.
+from comfy.cli_args import args
+
+if not torch.cuda.is_available():
+    args.cpu = True
+
+from comfy.ldm.modules import sub_quadratic_attention as sqa  # noqa: E402
+from comfy.ldm.modules.attention import attention_basic, attention_split, attention_sub_quad  # noqa: E402
 
 try:
     from comfy.ldm.qwen_image21.model import causal_mask
