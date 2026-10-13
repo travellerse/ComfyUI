@@ -1078,7 +1078,7 @@ def _try_quantized_linear_input_act(x, weight, bias, input_act, act_weight, act_
         )
 
 
-def linear_transposed(linear, x):
+def linear_transposed(linear, x, materialise=True):
     """``linear(x)`` computed as ``(weight @ x.T).T``.
 
     rocBLAS tiles ``x @ weight.T`` badly when the reduction is several times the output width.
@@ -1104,7 +1104,9 @@ def linear_transposed(linear, x):
         weight, bias = res[0], res[1]
     else:
         weight, bias = cast_bias_weight(linear, x, offloadable=False)
-    out = (weight @ x.transpose(-1, -2)).transpose(-1, -2).contiguous()
+    out = (weight @ x.transpose(-1, -2)).transpose(-1, -2)
+    if materialise:
+        out = out.contiguous()
     if bias is not None:
         out = out + bias
     return out

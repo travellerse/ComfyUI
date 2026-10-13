@@ -71,8 +71,16 @@ class SwiGLUFeedForward(nn.Module):
 
     def forward(self, x):
         if self.fused:
-            return comfy.ops.linear_input_act(self.out, self.gate_up(x), "swiglu",
-                                              transposed=self.transposed_down_projection)
+            # gate_up's [2*hidden x tokens] product is returned as a view: rocBLAS tiles this
+            # reduction badly in the standard orientation, and the only consumer is swiglu,
+            # which reads the strided form no slower. Measured end to end on gfx1030 / ROCm 7.2
+            # at the production shapes (5120 steady, 5167 prefix-fill).
+            # evidence/OPTIMIZATION_LEDGER.md Q21-OPT-035.
+            comfy.ops.run_every_op()
+            return comfy.ops.linear_input_act(
+                self.out,
+                comfy.ops.linear_transposed(self.gate_up, x, materialise=False),
+                "swiglu", transposed=self.transposed_down_projection)
         return self.out(F.silu(self.gate_layer(x)) * self.proj(x))
 
 
