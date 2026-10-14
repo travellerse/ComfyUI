@@ -952,7 +952,14 @@ class ModelPatcher:
 
     def pin_weight_to_device(self, key):
         weight, set_func, convert_func = get_key_weight(self.model, key)
-        if comfy.model_management.pin_memory(weight):
+        # The weight is a CPU buffer here, so its own .device cannot say which device a
+        # later non-blocking copy of it will read it for; the patcher can, and it does not
+        # change while these pins are alive (load_device is only ever reassigned on freshly
+        # cloned patchers, which start with an empty pinned set). Deliberately load_device
+        # and not the enclosing call's device_to: partially_unload() pins with
+        # device_to == offload_device, i.e. the CPU device these buffers are being *evicted
+        # to*, while the copies that will read them back are issued to load_device.
+        if comfy.model_management.pin_memory(weight, device=self.load_device):
             self.pinned.add(key)
 
     def unpin_weight(self, key):

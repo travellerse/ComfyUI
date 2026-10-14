@@ -1668,7 +1668,7 @@ def discard_cuda_async_error():
         #Dump it! We already know about it from the synchronous return
         pass
 
-def pin_memory(tensor, evict_active=True):
+def pin_memory(tensor, evict_active=True, device=None):
     global TOTAL_PINNED_MEMORY
     if MAX_PINNED_MEMORY <= 0:
         return False
@@ -1698,7 +1698,14 @@ def pin_memory(tensor, evict_active=True):
         return False
 
     if torch.cuda.cudart().cudaHostRegister(ptr, size, 1) == 0:
-        PINNED_MEMORY[ptr] = size
+        # The device is recorded here, at registration, and not looked up at release time:
+        # cudaHostRegister is a process-wide range registration that names no device, and by
+        # the time the buffer is released the tensor is a CPU tensor again while the "current
+        # device" belongs to whoever happens to be running. device=None means the owner
+        # releases the buffer under a scope of its own (wan syncs the streams it tracked,
+        # seedvr syncs the device it copies on) and is enumerated by
+        # tests-unit/comfy_test/pin_memory_unregister_ordering_test.py rather than guessed at.
+        PINNED_MEMORY[ptr] = (size, device)
         TOTAL_PINNED_MEMORY += size
         return True
     else:
@@ -1718,17 +1725,33 @@ def unpin_memory(tensor):
     ptr = tensor.data_ptr()
     size = tensor.nbytes
 
-    size_stored = PINNED_MEMORY.get(ptr, None)
-    if size_stored is None:
+    registration = PINNED_MEMORY.get(ptr, None)
+    if registration is None:
         logging.warning("Tried to unpin tensor not pinned by ComfyUI")
         return False
+
+    size_stored, pin_device = registration
 
     if size != size_stored:
         logging.warning("Size of pinned tensor changed")
         return False
 
+    # A non-blocking host-to-device copy of this buffer may still be in flight, and
+    # cudaHostUnregister is a host-side call that no stream orders it against. Sync the
+    # device the buffer was registered for -- not the "current" one, which at release time
+    # belongs to whatever is running and is not what the copy targeted.
+    if pin_device is not None:
+        try:
+            torch.cuda.synchronize(pin_device)
+        except Exception as exc:
+            # Fail closed: an unsyncable device is a device that might still be reading the
+            # buffer, so the registration stays. No discard_cuda_async_error() here either --
+            # that helper enqueues fresh work, which is the opposite of what this path wants.
+            logging.warning("Unpin skipped, device synchronization failed: {}".format(exc))
+            return False
+
     if torch.cuda.cudart().cudaHostUnregister(ptr) == 0:
-        size = PINNED_MEMORY.pop(ptr)
+        size = PINNED_MEMORY.pop(ptr)[0]
         TOTAL_PINNED_MEMORY -= size
         return True
     else:
