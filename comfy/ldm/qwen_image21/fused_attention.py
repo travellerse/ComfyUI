@@ -301,6 +301,24 @@ def is_supported(query, key_t, value, upcast_attention=False, mask=None):
     return _load_triton()[0] is not None
 
 
+def needs_free_memory_probe(query, key_t, value, upcast_attention=False, mask=None):
+    """Whether deciding this call requires asking the driver at all. A pure function.
+
+    The affordability check exists to un-veto the score budget, so it is consulted only when the
+    geometry could be served and the budget would otherwise hand the call back. That ordering is
+    not cosmetic: `get_free_memory` measured 65.7 us per call on gfx1030 and 62.7 us of that is
+    `torch.cuda.memory_stats` (bench/probe_free_memory_cost.py), so a masked text segment must not
+    pay it. Deliberately narrower than `_unsupported_reason`: device-ness and autograd state are
+    NOT checked here, because the routing bookkeeping must stay identical off-device and the
+    kernel's own check remains the authority on whether it can serve.
+    """
+    if mask is not None or upcast_attention:
+        return False
+    if query.dim() != 3 or query.shape[2] != SUPPORTED_HEAD_DIM:
+        return False
+    return score_matrix_bytes(query, key_t) <= SCORE_BUDGET_BYTES
+
+
 def fused_attention_guarded(query, key_t, value, scale, upcast_attention, mask):
     """The hook the DiT passes: `fused_attention`, except where the fallback is the better call.
 
@@ -308,8 +326,9 @@ def fused_attention_guarded(query, key_t, value, scale, upcast_attention, mask):
     "can this shape be served by this kernel", which its device tests and the benchmark harness
     depend on. Whether it *should* be served is routing policy, and it belongs at the call site.
     """
-    mem_free = model_management.get_free_memory(query.device, True)[0] if query.is_cuda else None
-    if prefer_fallback(query, key_t, mem_free):
-        stats["budget_fallbacks"] += 1
-        return None
+    if needs_free_memory_probe(query, key_t, value, upcast_attention, mask):
+        mem_free = model_management.get_free_memory(query.device, True)[0] if query.is_cuda else None
+        if prefer_fallback(query, key_t, mem_free):
+            stats["budget_fallbacks"] += 1
+            return None
     return fused_attention(query, key_t, value, scale, upcast_attention, mask)
