@@ -580,6 +580,9 @@ class Qwen35Transformer(Llama2_):
 
         if config.lm_head:
             self.lm_head = ops.Linear(config.hidden_size, config.vocab_size, bias=False, device=device, dtype=dtype)
+        # Built with nn.Module.__init__ rather than Llama2_.__init__, so the optional policy that
+        # the inherited Llama2_.forward reads has to be defaulted here too.
+        self.attention_policy = None
 
     def compute_freqs_cis(self, position_ids, device):
         rotary_dim = int(self.config.head_dim * self.config.partial_rotary_factor)
