@@ -91,14 +91,18 @@ def test_the_affordability_boundary_is_the_measured_one_and_below_the_ladder():
 # --- policy: the hook the DiT actually passes -------------------------------------------
 
 def test_guarded_hook_does_not_query_the_device_for_cpu_tensors(monkeypatch):
+    """A serveable geometry off-device must still route, without paying a driver round trip."""
     from comfy import model_management
 
     def boom(*a, **kw):
         raise AssertionError("must not ask for device memory about a CPU tensor")
 
     monkeypatch.setattr(model_management, "get_free_memory", boom)
-    q, key_t, v = _qkv()
-    assert fa.fused_attention_guarded(q, key_t, v, DIM ** -0.5, False, None) is None
+    q, key_t, v = _probe_shape()
+    assert fa.needs_free_memory_probe(q, key_t, v, False, None) is True   # geometry wants the answer
+    before = fa.stats["budget_fallbacks"]
+    assert fa.fused_attention_guarded(q, key_t, v, 128 ** -0.5, False, None) is None
+    assert fa.stats["budget_fallbacks"] == before + 1                      # decided by the budget alone
 
 
 def test_guarded_hook_declines_masked_calls_without_touching_triton():
@@ -106,6 +110,56 @@ def test_guarded_hook_declines_masked_calls_without_touching_triton():
     mask = torch.zeros(BH, Q_TOKENS, K_TOKENS)
     assert fa.fused_attention_guarded(q, key_t, v, DIM ** -0.5, False, mask) is None
     assert fa.stats["budget_fallbacks"] + fa.stats["fallback_calls"] > 0
+
+
+# --- probe ordering: the driver query is the expensive part (65.7 us/call on gfx1030) --------
+
+def _probe_shape(bh=2, q=256, k=512, dim=128):
+    """fp16, head_dim 128: the geometry `_unsupported_reason` accepts. Score = bh*q*k*2 bytes."""
+    query = torch.randn(bh, q, dim, dtype=torch.float16)
+    key_t = torch.randn(bh, dim, k, dtype=torch.float16)
+    value = torch.randn(bh, k, dim, dtype=torch.float16)
+    return query, key_t, value
+
+
+def test_probe_runs_only_for_served_geometry_below_the_budget():
+    q, key_t, v = _probe_shape()
+    with torch.no_grad():
+        assert fa.needs_free_memory_probe(q, key_t, v, False, None) is True
+        # above budget: the budget already says "serve", so the answer needs no driver read
+        big_q, big_key, big_v = _probe_shape(bh=32, q=2048, k=10287)
+        assert fa.score_matrix_bytes(big_q, big_key) > fa.SCORE_BUDGET_BYTES
+        assert fa.needs_free_memory_probe(big_q, big_key, big_v, False, None) is False
+
+
+def test_probe_is_skipped_for_geometry_the_kernel_could_not_serve_whatever_the_vram_is():
+    q, key_t, v = _probe_shape()
+    mask = torch.zeros(q.shape[0], q.shape[1], key_t.shape[2])
+    head_dim_mismatch = _probe_shape(dim=64)
+    with torch.no_grad():
+        assert fa.needs_free_memory_probe(q, key_t, v, False, mask) is False
+        assert fa.needs_free_memory_probe(q, key_t, v, True, None) is False
+        assert fa.needs_free_memory_probe(*head_dim_mismatch, False, None) is False
+
+
+def test_probe_gate_is_deliberately_blind_to_device_and_grad_state():
+    """Routing bookkeeping must not change off-device, so those checks stay in the kernel."""
+    q, key_t, v = _probe_shape()
+    assert q.is_cuda is False                       # this suite runs with no visible device
+    assert fa.needs_free_memory_probe(q, key_t, v, False, None) is True
+    with torch.no_grad():
+        assert fa.needs_free_memory_probe(q, key_t, v, False, None) is True   # same answer either way
+    assert fa.fused_attention(q, key_t, v, 128 ** -0.5, False, None) is None  # the kernel still declines
+
+
+def test_guarded_hook_ordering_does_not_regret_the_decision():
+    """Reordering must not change *what* is returned, only who gets asked."""
+    q, key_t, v = _probe_shape()
+    with torch.no_grad():
+        served = fa.fused_attention_guarded(q, key_t, v, 128 ** -0.5, False, None)
+    assert served is None or served.shape == q.shape          # CPU: the kernel declines on device grounds
+    masked = fa.fused_attention_guarded(q, key_t, v, 128 ** -0.5, False, torch.zeros(q.shape[0], q.shape[1], key_t.shape[2]))
+    assert masked is None
 
 
 # --- reachability: attention_sub_quad's ladder ------------------------------------------
