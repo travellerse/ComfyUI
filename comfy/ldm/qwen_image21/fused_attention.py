@@ -62,6 +62,12 @@ SUPPORTED_ARCHS = ("gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx10
 # 12120 MiB of 12272 with the fused path and was interrupted by the host-RAM guard before it could
 # finish in either mode (report 43 §3). So keeping the kernel there is a margin, not a demonstrated
 # benefit -- and it must not be described as a proven OOM guard.
+#
+# The budget is not the whole rule. When the fallback cannot afford even its smallest query chunk it
+# moves to two-pass sqrt(k_tokens) KV chunking, and `fused_attention` is not on that path at all, so
+# there the kernel is offered the call first regardless of score size. That regime is the one
+# bench/bench_starved_vram.py measures; until it reports, the starvation branch is a hypothesis with
+# a mechanism, not a measured win.
 SCORE_BUDGET_BYTES = 1024 ** 3
 
 
@@ -70,8 +76,36 @@ def score_matrix_bytes(query, key_t):
     return query.shape[0] * query.shape[1] * key_t.shape[2] * query.element_size()
 
 
-def prefer_fallback(query, key_t):
-    """Whether the sub-quadratic path should handle this call. A pure function of the shapes."""
+# What the fallback really needs on top of one score tensor before it can run the chunk: measured
+# on gfx1030 (bench/bench_starved_vram.py v2, BH=32 q=1024 k=10287, 643 MiB of scores) as a cliff
+# between 900 MiB priced-free, where the sub-quadratic chunk still ran at 22.1 ms, and 700 MiB,
+# where the same call raised OutOfMemoryError while this kernel ran the identical geometry in
+# 31.8 ms. Anything in that band is guesswork, so the boundary sits inside it rather than on the
+# optimistic end: 1.25x was chosen to make the surviving call, not to win the speed race.
+FALLBACK_POOL_FACTOR = 1.25
+
+
+def sub_quad_cannot_afford_chunk(query, key_t, mem_free_bytes):
+    """Whether the fallback could not allocate the score matrix this chunk is about to build.
+
+    `attention_sub_quad` gets `mem_free_bytes` from `model_management.get_free_memory()`, which
+    counts driver-free *plus* torch's reserved-but-unallocated pool -- so this is false whenever the
+    pool can serve the chunk, which is exactly the warm-pool case that measured the fallback as the
+    faster one. The factor is the measured one above, not the greedy ladder's 4x (ladder:
+    comfy/ldm/modules/attention.py, `batch_x_heads * bytes * chunk * 4.0 * k_tokens`): at 4x the
+    kernel would take over geometry the fallback serves faster.
+    """
+    return mem_free_bytes < score_matrix_bytes(query, key_t) * FALLBACK_POOL_FACTOR
+
+
+def prefer_fallback(query, key_t, mem_free_bytes=None):
+    """Whether the sub-quadratic path should handle this call.
+
+    Shape-based unless the caller also says how much VRAM the fallback has: a fallback that cannot
+    allocate the chunk it is about to run is not the cheaper one, whatever the score budget says.
+    """
+    if mem_free_bytes is not None and sub_quad_cannot_afford_chunk(query, key_t, mem_free_bytes):
+        return False
     return score_matrix_bytes(query, key_t) <= SCORE_BUDGET_BYTES
 
 
@@ -274,7 +308,8 @@ def fused_attention_guarded(query, key_t, value, scale, upcast_attention, mask):
     "can this shape be served by this kernel", which its device tests and the benchmark harness
     depend on. Whether it *should* be served is routing policy, and it belongs at the call site.
     """
-    if prefer_fallback(query, key_t):
+    mem_free = model_management.get_free_memory(query.device, True)[0] if query.is_cuda else None
+    if prefer_fallback(query, key_t, mem_free):
         stats["budget_fallbacks"] += 1
         return None
     return fused_attention(query, key_t, value, scale, upcast_attention, mask)

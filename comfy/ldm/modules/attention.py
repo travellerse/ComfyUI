@@ -385,6 +385,13 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
     if query_chunk_size is None:
         query_chunk_size = 512
 
+    hidden_states = None
+    if kv_chunk_size is None and fused_attention is not None:
+        # Nothing in the chunk ladder was affordable, so the fallback below would stream K/V in
+        # sqrt(k_tokens) pieces over two passes - and the fused hook does not sit in that path.
+        # Offer the whole call to the backend first; it returns None to decline.
+        hidden_states = fused_attention(query, key, value, dim_head ** -0.5, upcast_attention, mask)
+
     if mask is not None:
         if len(mask.shape) == 2:
             bs = 1
@@ -392,19 +399,20 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
             bs = mask.shape[0]
         mask = mask.reshape(bs, -1, mask.shape[-2], mask.shape[-1]).expand(b, heads, -1, -1).reshape(-1, mask.shape[-2], mask.shape[-1])
 
-    hidden_states = efficient_dot_product_attention(
-        query,
-        key,
-        value,
-        query_chunk_size=query_chunk_size,
-        kv_chunk_size=kv_chunk_size,
-        kv_chunk_size_min=kv_chunk_size_min,
-        use_checkpoint=False,
-        upcast_attention=upcast_attention,
-        mask=mask,
-        inplace_softmax=inplace_softmax,
-        fused_attention=fused_attention,
-    )
+    if hidden_states is None:
+        hidden_states = efficient_dot_product_attention(
+            query,
+            key,
+            value,
+            query_chunk_size=query_chunk_size,
+            kv_chunk_size=kv_chunk_size,
+            kv_chunk_size_min=kv_chunk_size_min,
+            use_checkpoint=False,
+            upcast_attention=upcast_attention,
+            mask=mask,
+            inplace_softmax=inplace_softmax,
+            fused_attention=fused_attention,
+        )
 
     hidden_states = hidden_states.to(dtype)
     if skip_output_reshape:
