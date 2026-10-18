@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import comfy.model_management
+import os
 from .k_diffusion import sampling as k_diffusion_sampling
 from .extra_samplers import uni_pc
 from typing import TYPE_CHECKING, Callable, NamedTuple, Any
@@ -606,7 +607,17 @@ def cfg_function(model, cond_pred, uncond_pred, cond_scale, x, timestep, model_o
 
 #The main sampling function shared by all the samplers
 #Returns denoised
+_sampling_step_count = 0
 def sampling_function(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
+    # Off by default. At 1920x1440 the 50-step baseline cannot pin the display's framebuffer:
+    # the freed score chunks leave the pool fragmented (measured with 6.8 GB of driver-free
+    # VRAM). Releasing the empty segments every N steps keeps the driver able to satisfy the
+    # scanout pin; see report 62 H.3.
+    global _sampling_step_count
+    _sampling_step_count += 1
+    _empty_every = int(os.environ.get("COMFY_EMPTY_CACHE_EVERY", "0") or 0)
+    if _empty_every and _sampling_step_count % _empty_every == 0 and torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
     if math.isclose(cond_scale, 1.0) and model_options.get("disable_cfg1_optimization", False) == False:
         uncond_ = None
     else:
