@@ -1,4 +1,5 @@
 import math
+import os
 import sys
 import inspect
 import json
@@ -317,6 +318,72 @@ def attention_basic(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
         )
     return out
 
+TRITON_REPACK_KEY = os.environ.get("Q21_TRITON_REPACK_KEY", "0") == "1"
+_repack_state = None
+_repack_stats = {"applied": 0, "skipped": 0}
+
+
+def _load_repack_kernel():
+    """Build the tiled key repack kernel once, or return the reason it is unavailable.
+
+    Deferred like the fused backend: importing triton costs real time at startup and the
+    default path must not pay for a backend it may never use.
+    """
+    global _repack_state
+    if _repack_state is not None:
+        return _repack_state
+    try:
+        import triton
+        import triton.language as tl
+    except Exception as exc:
+        _repack_state = (None, None, f"triton unavailable: {exc}")
+        return _repack_state
+
+    @triton.jit
+    def _repack(K, Out, N, s0, s1, s2, sob, BD: tl.constexpr, BN: tl.constexpr):
+        # [heads, dim, tokens] with the token axis strided -> packed [heads, dim, tokens].
+        # Tiled so both sides are coalesced: the load is contiguous along dim, the store
+        # contiguous along tokens.
+        pid_n = tl.program_id(0)
+        pid_d = tl.program_id(1)
+        bh = tl.program_id(2)
+        offs_n = pid_n * BN + tl.arange(0, BN)
+        offs_d = pid_d * BD + tl.arange(0, BD)
+        tile = tl.load(K + bh * s0 + offs_d[None, :] * s1 + offs_n[:, None] * s2,
+                       mask=offs_n[:, None] < N, other=0.0)
+        tl.store(Out + bh * sob + offs_d[:, None] * N + offs_n[None, :],
+                 tl.trans(tile), mask=offs_n[None, :] < N)
+
+    _repack_state = (triton, _repack, None)
+    return _repack_state
+
+
+def repack_key_packed(key, dim_head, k_tokens, block_d=32, block_n=128):
+    """Return `key` as a packed (heads, dim, tokens) tensor, or None if not applicable.
+
+    rocBLAS/Tensile picks a much weaker micro-tile for a strided B operand on gfx1030, but
+    torch's own .contiguous() costs a transposed gather that eats the whole gain; this tiled
+    version costs ~2 ms instead of ~26 ms. See docs/rdna2/performance in the Triton tree.
+    """
+    if not TRITON_REPACK_KEY:
+        return None
+    triton_mod, kernel, reason = _load_repack_kernel()
+    if kernel is None or dim_head % block_d:
+        _repack_stats["skipped"] += 1
+        return None
+    try:
+        out = torch.empty((key.shape[0], dim_head, k_tokens), device=key.device, dtype=key.dtype)
+        kernel[(triton_mod.cdiv(k_tokens, block_n), dim_head // block_d, key.shape[0])](
+            key, out, k_tokens, key.stride(0), key.stride(1), key.stride(2),
+            out.stride(0), BD=block_d, BN=block_n, num_warps=4)
+    except Exception as exc:
+        logging.warning(f"key repack failed, falling back to the strided operand: {exc}")
+        _repack_stats["skipped"] += 1
+        return None
+    _repack_stats["applied"] += 1
+    return out
+
+
 @wrap_attn
 def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, query_chunk_size=None, kv_chunk_size=None, contiguous_key=False, inplace_softmax=False, fused_attention=None, **kwargs):
     attn_precision = get_attn_precision(attn_precision, query.dtype)
@@ -342,6 +409,9 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
         query = query.permute(0, 2, 1, 3).reshape(b * heads, -1, dim_head)
         value = value.permute(0, 2, 1, 3).reshape(b * heads, -1, dim_head)
         key = key.permute(0, 2, 3, 1).reshape(b * heads, dim_head, -1)
+        repacked = repack_key_packed(key, dim_head, key.shape[-1])
+        if repacked is not None:
+            key = repacked
         if contiguous_key:
             # EXPERIMENTAL, off by default. The permute above leaves `key` as a strided
             # view (strides ~ (dim_head, 1, k_tokens)), and rocBLAS/Tensile on gfx1030
