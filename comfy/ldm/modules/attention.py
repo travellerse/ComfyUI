@@ -412,6 +412,11 @@ def attention_sub_quad(query, key, value, heads, mask=None, attn_precision=None,
         repacked = repack_key_packed(key, dim_head, key.shape[-1])
         if repacked is not None:
             key = repacked
+            # The head merge above is a view, so `query` reaches baddbmm as (dim_head,
+            # tokens*dim_head, 1) -- head-interleaved. Measured on gfx1030 at the production
+            # geometry, that A-operand stride alone costs QK^T 38.0 ms against 23.1 ms for the
+            # same product from a contiguous query, and the 42 MB copy needed to fix it is ~1 ms.
+            query = query.contiguous()
         if contiguous_key:
             # EXPERIMENTAL, off by default. The permute above leaves `key` as a strided
             # view (strides ~ (dim_head, 1, k_tokens)), and rocBLAS/Tensile on gfx1030
