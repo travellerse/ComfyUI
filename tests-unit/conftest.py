@@ -1,6 +1,27 @@
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_fused_attention_stats():
+    """``fused_attention.stats`` is a module-level counter that outlives a test.
+
+    Several suites drive the same kernel, so a case that asserts an exact call count would
+    otherwise see whatever the previous file left behind. Both sides are reset; the module is
+    only touched once some test has imported it, so suites that never load it pay nothing.
+    """
+    import sys
+
+    def reset():
+        module = sys.modules.get("comfy.ldm.qwen_image21.fused_attention")
+        if module is not None:
+            for key in module.stats:
+                module.stats[key] = 0
+
+    reset()
+    yield
+    reset()
+
+
 @pytest.fixture
 def file_db(tmp_path, monkeypatch):
     """The real file database: WAL mode, both engines and their hooks, in ``tmp_path``."""
